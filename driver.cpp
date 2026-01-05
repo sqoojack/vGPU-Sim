@@ -20,27 +20,39 @@ int main() {
     rb->head.store(0);
     rb->tail.store(0);
 
-    std::cout << "Driver started. Input '1' for DRAW, '2' for CLEAR, '0' to EXIT:\n";
+    std::cout << "Commands: [1] DRAW_RECT (Heating), [2] CLEAR_SCREEN (Cooling), [0] EXIT\n";
 
     int input;
     while (std::cin >> input) {
-        if (rb->is_full()) {
-            std::cout << "Buffer full, waiting for firmware...\n";
+        if (rb->is_full()) continue;
+
+        uint32_t t = rb->tail.load(std::memory_order_relaxed);
+        
+        if (input == 1) { // DRAW_RECT
+            rb->buffer[t].type = CMD_DRAW_RECT;
+            rb->buffer[t].params[0] = rand() % 1920; // X 座標
+            rb->buffer[t].params[1] = rand() % 1080; // Y 座標
+            rb->buffer[t].params[2] = 100;           // Width
+            rb->buffer[t].params[3] = 100;           // Height
+        } 
+        else if (input == 2) { // CLEAR
+            rb->buffer[t].type = CMD_CLEAR_SCREEN;
+            rb->buffer[t].params[0] = 0xFF0000; // Red color
+        }
+        else if (input == 0) { // EXIT (必須保留，以通知 Firmware 關閉)
+            rb->buffer[t].type = CMD_EXIT;
+            rb->tail.store((t + 1) % RING_SIZE, std::memory_order_release);
+            std::cout << "Exit command sent to Firmware.\n";
+            break; // Driver 自己也跳出迴圈
+        }
+        else {
             continue;
         }
 
-        uint32_t t = rb->tail.load(std::memory_order_relaxed);
-        if (input == 1) rb->buffer[t] = {CMD_DRAW_RECT, 100};
-        else if (input == 2) rb->buffer[t] = {CMD_CLEAR_SCREEN, 0};
-        else if (input == 0) {
-            rb->buffer[t] = {CMD_EXIT, 0};
-            rb->tail.store((t + 1) % RING_SIZE, std::memory_order_release);
-            break;
-        }
-
-        // 重要：使用 memory_order_release 確保資料寫入後才更新 tail
         rb->tail.store((t + 1) % RING_SIZE, std::memory_order_release);
-        std::cout << "Command sent.\n";
+        
+        // 讀取當前 Firmware 狀態
+        std::cout << "Command sent. GPU Temp: " << rb->status.current_temperature.load() << "°C\n";
     }
 
     munmap(rb, sizeof(CommandRingBuffer));

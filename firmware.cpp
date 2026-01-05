@@ -7,35 +7,66 @@
 #include <unistd.h>
 #include "common.h"
 
+const float AMBIENT_TEMP = 40.0f;
+const float COOLING_FACTOR = 0.02f; // 散熱係數
+
+void add_temp_atomic(std::atomic<float>& atomic_temp, float delta) {
+    float current = atomic_temp.load(std::memory_order_relaxed);
+    float desired;
+    do {desired = current + delta;} 
+    while (!atomic_temp.compare_exchange_weak(current, desired, 
+            std::memory_order_release, 
+            std::memory_order_acquire));
+};
+
 int main() {
-    // 1. 打開現有的共享記憶體
     int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
     auto* rb = (CommandRingBuffer*)mmap(NULL, sizeof(CommandRingBuffer), 
                                        PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
-    std::cout << "Firmware (GPU) running and polling for commands...\n";
+    // 初始化狀態
+    rb->status.current_temperature.store(40.0f); // 初始室溫 40 度
 
-    bool running = true;
-    while (running) {
+    while (true) {
+        // 1. 物理散熱計算 (每循環一次計算一次)
+        float current_t = rb->status.current_temperature.load(std::memory_order_relaxed);
+        float cooling = COOLING_FACTOR * (current_t - AMBIENT_TEMP);
+        add_temp_atomic(rb->status.current_temperature, -cooling);
+
+        // 2. 更新 Heartbeat (Day 3)
+        rb->status.heartbeat.fetch_add(1, std::memory_order_relaxed);
+
         if (rb->is_empty()) {
-            usleep(100000); // 稍微休息，降低 CPU 佔用
+            usleep(10000); // 降低閒置時的 CPU 消耗 (100Hz 輪詢)
             continue;
         }
 
-        // 重要：使用 memory_order_acquire 確保看到最新的資料內容
-        uint32_t h = rb->head.load(std::memory_order_relaxed);
+        uint32_t h = rb->head.load(std::memory_order_acquire); // 改用 acquire
         Command cmd = rb->buffer[h];
+        float heat_gain = 0.0f;
 
-        // 模擬執行指令
-        if (cmd.type == CMD_DRAW_RECT) std::cout << "[GPU] Executing DRAW_RECT\n";
-        else if (cmd.type == CMD_CLEAR_SCREEN) std::cout << "[GPU] Executing CLEAR_SCREEN\n";
-        else if (cmd.type == CMD_EXIT) running = false;
+        if (cmd.type == CMD_DRAW_RECT) {
+            float area_factor = (cmd.params[2] * cmd.params[3]) / 10000.0f;
+            heat_gain = 1.5f + area_factor;
+            usleep(150000);
+        } 
+        else if (cmd.type == CMD_CLEAR_SCREEN) {
+            heat_gain = 0.5f;
+            usleep(50000);
+        }
+        else if (cmd.type == CMD_EXIT) {
+            // 修正：退出前必須更新 head
+            rb->head.store((h + 1) % RING_SIZE, std::memory_order_release);
+            std::cout << "[GPU] Orderly shutdown completed.\n";
+            break; 
+        }
 
-        // 更新 head，表示已處理完畢
+        add_temp_atomic(rb->status.current_temperature, heat_gain);
+        printf("[GPU] CMD: %d | Temp: %.2f°C\n", cmd.type, rb->status.current_temperature.load());
+
         rb->head.store((h + 1) % RING_SIZE, std::memory_order_release);
     }
 
-    std::cout << "Firmware shutting down.\n";
-    shm_unlink(SHM_NAME); // 清除共享記憶體
+    shm_unlink(SHM_NAME);
     return 0;
 }

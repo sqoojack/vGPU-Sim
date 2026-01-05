@@ -15,7 +15,13 @@ enum CommandType {
 
 struct Command {
     CommandType type;
-    uint32_t data;
+    uint32_t params[4];
+};
+
+// 用於模擬硬體狀態的結構
+struct SystemStatus {
+    std::atomic<float> current_temperature;
+    std::atomic<uint64_t> heartbeat; // Day 3 Watchdog 會用到
 };
 
 struct CommandRingBuffer {
@@ -24,6 +30,7 @@ struct CommandRingBuffer {
     std::atomic<uint32_t> head; 
     std::atomic<uint32_t> tail;
     Command buffer[RING_SIZE];
+    SystemStatus status;
 
     // 檢查 Buffer 是否已滿
     bool is_full() const {
