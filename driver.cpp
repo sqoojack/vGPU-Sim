@@ -7,7 +7,7 @@
 #include <thread> // [Day 3]
 #include <unistd.h>
 
-// [Day 3] 看門狗執行緒：監控 Heartbeat
+// to implement watchdog
 void watchdog_thread_func(CommandRingBuffer *rb, bool *running) {
   uint64_t last_heartbeat = rb->status.heartbeat.load();
   int stuck_seconds = 0;
@@ -35,8 +35,7 @@ void watchdog_thread_func(CommandRingBuffer *rb, bool *running) {
     if (current_heartbeat == last_heartbeat) {
       stuck_seconds++;
       if (stuck_seconds >= 3) {
-        std::cout << "\n\033[1;31m[WATCHDOG ALERT] Firmware HANG detected! (No "
-                     "heartbeat for 3s)\033[0m\n";
+        std::cout << "\n\033[1;31m[WATCHDOG ALERT] Firmware HANG detected! (No heartbeat for 3s)\033[0m\n";
         // 為了避免洗頻，觸發後可以重置計數，或者讓 Driver 進入恢復流程
         stuck_seconds = 0;
       }
@@ -48,24 +47,24 @@ void watchdog_thread_func(CommandRingBuffer *rb, bool *running) {
 }
 
 int main() {
+	srand(time(NULL));
 	int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+	
 	ftruncate(shm_fd, sizeof(CommandRingBuffer));
 	auto *rb =
 		(CommandRingBuffer *)mmap(NULL, sizeof(CommandRingBuffer),
-									PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+								PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
 	rb->head.store(0);
 	rb->tail.store(0);
 	rb->status.heartbeat.store(0); // 加上這一行, 強制歸零 -> 清除舊的髒數據
 	rb->status.current_temperature.store(40.0f); // 溫度也重置
 
-	// [Day 3] 啟動 Watchdog
+	// start Watchdog
 	bool app_running = true;
 	std::thread wd_thread(watchdog_thread_func, rb, &app_running);
 
-	std::cout
-		<< "Commands: [1] DRAW (Heat), [2] CLEAR, [3] CHECKSUM, [9] HANG (Test "
-			"Watchdog), [0] EXIT\n";
+	std::cout << "Commands: [1] DRAW (Heat), [2] CLEAR, [3] CHECKSUM, [9] HANG (Test Watchdog), [0] EXIT\n";
 
 	int input;
 	
@@ -84,25 +83,35 @@ int main() {
 		uint32_t t = rb->tail.load(std::memory_order_relaxed);
 
 		if (input == 1) {
-		rb->buffer[t].type = CMD_DRAW_RECT;
-		// [Day 2] 必須設定參數
-		rb->buffer[t].params[2] = 100;
-		rb->buffer[t].params[3] = 100;
-		} else if (input == 2) {
-		rb->buffer[t].type = CMD_CLEAR_SCREEN;
-		rb->buffer[t].params[0] = 0xFF0000;
+			rb->buffer[t].type = CMD_DRAW_RECT;
+			// [Day 2] 必須設定參數
+			rb->buffer[t].params[2] = 100;
+			rb->buffer[t].params[3] = 100;
+		}
+		else if (input == 2) {
+			rb->buffer[t].type = CMD_CLEAR_SCREEN;
+			rb->buffer[t].params[0] = 0xFF0000;
 		}
 
 		else if (input == 3) { // [Day 4] 測試 Assembly
-		rb->buffer[t].type = CMD_CHECKSUM;
-		// 隨機填入 4 個數字
-		rb->buffer[t].params[0] = 10;
-		rb->buffer[t].params[1] = 20;
-		rb->buffer[t].params[2] = 30;
-		rb->buffer[t].params[3] = 40;
-		std::cout << "[Host] Requesting ASM Checksum for (10, 20, 30, 40). "
-					"Expect: 100\n";
-		}
+            rb->buffer[t].type = CMD_CHECKSUM;
+            uint32_t v0 = rand() % 100;
+            uint32_t v1 = rand() % 100;
+            uint32_t v2 = rand() % 100;
+            uint32_t v3 = rand() % 100;
+
+            rb->buffer[t].params[0] = v0;
+            rb->buffer[t].params[1] = v1;
+            rb->buffer[t].params[2] = v2;
+            rb->buffer[t].params[3] = v3;
+
+            // Host 端先算一次答案，用來驗證 Device (Firmware) 算得對不對
+            uint32_t expected = v0 + v1 + v2 + v3;
+
+            std::cout << "[Host] Requesting ASM Checksum for (" 
+                      << v0 << ", " << v1 << ", " << v2 << ", " << v3 
+                      << "). Expect: " << expected << "\n";
+        }
 
 		else if (input == 9) { // [Day 3] 測試看門狗
 		rb->buffer[t].type = CMD_SIMULATE_HANG;
