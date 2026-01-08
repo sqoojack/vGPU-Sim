@@ -101,7 +101,7 @@ int main() {
 		}
 
 		else if (cmd.type == CMD_CHECKSUM) {
-			// [Day 4] 呼叫 Assembly 優化函式
+			// 呼叫 Assembly 優化函式
 			// 計算 params[4] 陣列的總和
 			uint32_t sum = checksum_arm64(cmd.params, 4);
 			std::cout << "[GPU] ASM Checksum: " << sum << " (Verified)\n";
@@ -125,11 +125,6 @@ int main() {
 		// 應用熱量
 		add_temp_atomic(rb->status.current_temperature, heat_gain);
 
-		// 只有非降頻狀態才印 Log
-		// if (current_t <= THERMAL_LIMIT) {
-		// printf("[GPU] CMD: %d | Temp: %.2f°C\n", cmd.type,
-		// 		rb->status.current_temperature.load());
-		// }
 		printf("[GPU] CMD: %d | Temp: %.2f°C %s\n", 
            cmd.type, 
            rb->status.current_temperature.load(),
