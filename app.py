@@ -11,38 +11,37 @@ st.set_page_config(page_title="vGPU Sim", layout="wide")
 st.title("🖥️ vGPU Architecture Simulator (macOS/Linux)")
 
 # --- 設定區 ---
-# 必須與 common.h 中的定義一致
 SHM_FILENAME = "vgpu_ram.bin" 
 WIDTH = 640
 HEIGHT = 480
 VRAM_SIZE = WIDTH * HEIGHT * 4
 
-# GPUState Header format (與 C++ struct GPUState 對齊)
-# uint32 magic (4 bytes)
-# uint32 running (4 bytes)
-# uint32 frame_counter (4 bytes)
-# float temperature (4 bytes)
-# 總共 16 bytes
-HEADER_FMT = "IIIf" 
+# --- 關鍵修正：結構必須與 C++ common.h 完全一致 ---
+# C++ struct 佈局 (使用 #pragma pack(1)):
+# 1. uint32 magic (4B)
+# 2. uint32 running (4B)
+# 3. uint32 frame_counter (4B)
+# 4. float temperature (4B)
+# 5. uint64 last_heartbeat (8B)  <-- 新增
+# 6. uint32 watchdog_reset_count (4B) <-- 新增
+# ----------------------------------------------
+# 格式字串: I (int), f (float), Q (unsigned long long)
+HEADER_FMT = "IIIfQI" 
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 def get_data():
-    # 檢查檔案是否存在
     if not os.path.exists(SHM_FILENAME):
         return None, None
     
     try:
-        # 使用標準檔案開啟模式
         with open(SHM_FILENAME, "r+b") as f:
-            # 建立記憶體映射 (唯讀模式即可)
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             
-            # 1. 讀取標頭 (Header)
+            # 1. 讀取標頭
             header_bytes = mm[:HEADER_SIZE]
             header_data = struct.unpack(HEADER_FMT, header_bytes)
             
             # 2. 讀取 VRAM
-            # VRAM 緊接著 Header 之後
             vram_offset = HEADER_SIZE
             vram_bytes = mm[vram_offset : vram_offset + VRAM_SIZE]
             
@@ -52,49 +51,55 @@ def get_data():
         st.error(f"讀取錯誤: {e}")
         return None, None
 
-# 執行讀取
 header, vram_bytes = get_data()
 
 if header:
-    magic, running, frame, temp = header
+    # 解包順序要對應 HEADER_FMT
+    magic, running, frame, temp, heartbeat, wd_count = header
     
-    # 驗證 Magic Number (確保我們讀到正確的 vGPU 記憶體檔)
-    # 0x56475055 = "VGPU" in ASCII
     if magic != 0x56475055:
-        st.error(f"記憶體檔案損毀或版本不符 (Magic: {hex(magic)})")
+        st.error(f"記憶體標頭錯誤 (Magic: {hex(magic)}) - 請重新編譯 C++ 並重啟 firmware")
     else:
         col1, col2 = st.columns([3, 1])
         
         with col1:
             st.subheader("VRAM Visualization")
             if vram_bytes:
+                # 轉換 BGR 格式
                 raw_img = np.frombuffer(vram_bytes, dtype=np.uint8).reshape((HEIGHT, WIDTH, 4))
                 bgr_img = raw_img[:, :, :3]
                 st.image(bgr_img, channels="BGR", use_container_width=True)
         
         with col2:
             st.subheader("System Telemetry")
+            
+            # 狀態指示燈
+            status_color = "normal"
+            if not running: status_color = "off"
+            elif temp > 80: status_color = "inverse" # 過熱警告
+            
             st.metric("System Status", "Running" if running else "Stopped", 
                      delta="Online" if running else "Offline")
+            
             st.metric("Frame Counter", frame)
             
             # 溫度顯示
-            temp_delta = temp - 40.0
             st.metric("GPU Temperature", f"{temp:.1f} °C", 
-                     delta=f"{temp_delta:.1f} °C", 
-                     delta_color="inverse")
+                     delta=f"{temp - 40.0:.1f} °C" if temp > 0 else "0.0", 
+                     delta_color="inverse" if temp > 80 else "normal")
             
-            st.info(f"Memory File: {SHM_FILENAME}")
-            st.caption(f"VRAM Size: {VRAM_SIZE/1024:.0f} KB")
-        
-        # 自動刷新 (約 10 FPS)
+            # 新增：Watchdog 監控數據
+            st.markdown("---")
+            st.markdown("### 🛡️ Watchdog Status")
+            st.metric("Last Heartbeat", f"{heartbeat % 10000} ts")
+            st.metric("Watchdog Resets", f"{wd_count}", 
+                     delta_color="inverse" if wd_count > 0 else "off")
+
         time.sleep(0.1)
         st.rerun()
 
 else:
-    # 如果找不到檔案
-    st.warning(f"找不到韌體記憶體檔案: {SHM_FILENAME}")
+    st.warning(f"找不到記憶體檔案: {SHM_FILENAME}")
     st.info("請先執行: ./firmware")
-    
-    if st.button("嘗試重新連線"):
+    if st.button("重新連線"):
         st.rerun()

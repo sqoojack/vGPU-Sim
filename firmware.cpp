@@ -42,7 +42,7 @@ void* watchdog_thread(void* arg) {
             
             // 執行重置邏輯
             gpu->watchdog_reset_count++;
-            gpu->temperature = 40.0f; // 重置溫度
+            gpu->temperature = 37.0f; // 重置溫度
             
             // 在真實硬體會重啟，這裡我們強制跳出死迴圈或重啟主迴圈
             // 為了演示，我們簡單地更新 heartbeat 讓系統「復活」
@@ -142,6 +142,7 @@ int main() {
     memset(gpu, 0, sizeof(GPUState));
     gpu->magic = 0x56475055;
     gpu->running = 1;
+	gpu->temperature = 37.0f;
     gpu->last_heartbeat = (uint64_t)time(NULL);
     
     for(int i=0; i<MAX_TENANTS; i++) {
