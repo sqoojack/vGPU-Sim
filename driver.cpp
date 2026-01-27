@@ -1,141 +1,102 @@
-// clang++ -std=c++17 driver.cpp -o driver
-#include "common.h"
-#include <chrono> // [Day 3]
-#include <fcntl.h>
+// g++ driver.cpp -o driver -lpthread
+// ./driver 0
+// ./driver 1
 #include <iostream>
+#include <fcntl.h>
 #include <sys/mman.h>
-#include <thread> // [Day 3]
 #include <unistd.h>
+#include <stdlib.h>
+#include "common.h"
 
-// to implement watchdog
-void watchdog_thread_func(CommandRingBuffer *rb, bool *running) {
-  uint64_t last_heartbeat = rb->status.heartbeat.load();
-  int stuck_seconds = 0;
-  bool firmware_online = false; // [修正] 新增旗標：確認 Firmware 是否已上線
+struct GPUState* gpu;
+int tenant_id = -1;
 
-  std::cout << "[WATCHDOG] Monitoring thread started. Waiting for Firmware "
-               "signal...\n";
-
-  while (*running) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    uint64_t current_heartbeat = rb->status.heartbeat.load();
-
-    // 如果 Firmware 還沒上線 (heartbeat 還是 0)，就不開始計數
-    if (!firmware_online) {
-      if (current_heartbeat > 0) {
-        firmware_online = true;
-        std::cout << "[WATCHDOG] Firmware connected! Monitoring active.\n";
-        last_heartbeat = current_heartbeat;
-      }
-      continue; // Firmware 還沒準備好，下一秒再檢查
+void send_command(Command cmd) {
+    TenantContext* ctx = &gpu->tenants[tenant_id];
+    pthread_mutex_lock(&ctx->lock);
+    int next_tail = (ctx->tail + 1) % RING_BUFFER_SIZE;
+    while (next_tail == ctx->head) {
+        std::cout << "[Driver] Buffer full..." << std::endl;
+        pthread_cond_wait(&ctx->not_full, &ctx->lock);
+        next_tail = (ctx->tail + 1) % RING_BUFFER_SIZE;
     }
-
-    // Firmware 已經上線過，開始正常監控
-    if (current_heartbeat == last_heartbeat) {
-      stuck_seconds++;
-      if (stuck_seconds >= 3) {
-        std::cout << "\n\033[1;31m[WATCHDOG ALERT] Firmware HANG detected! (No heartbeat for 3s)\033[0m\n";
-        // 為了避免洗頻，觸發後可以重置計數，或者讓 Driver 進入恢復流程
-        stuck_seconds = 0;
-      }
-    } else {
-      stuck_seconds = 0;
-      last_heartbeat = current_heartbeat;
-    }
-  }
+    ctx->cmd_buffer[ctx->tail] = cmd;
+    ctx->tail = next_tail;
+    pthread_cond_signal(&ctx->not_empty);
+    pthread_mutex_unlock(&ctx->lock);
 }
 
-int main() {
-	srand(time(NULL));
-	int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-	
-	ftruncate(shm_fd, sizeof(CommandRingBuffer));
-	auto *rb =
-		(CommandRingBuffer *)mmap(NULL, sizeof(CommandRingBuffer),
-								PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+void print_menu() {
+    std::cout << "\n===== vGPU Driver (Tenant " << tenant_id << ") =====" << std::endl;
+    std::cout << "1. Draw Rect (Test Rendering)" << std::endl;
+    std::cout << "2. Clear Screen" << std::endl;
+    std::cout << "3. Test ARM64 Assembly (Addition)" << std::endl;
+    std::cout << "4. DMA Transfer" << std::endl;
+    std::cout << "9. SIMULATE HANG (Test Watchdog)" << std::endl;
+    std::cout << "0. Exit" << std::endl;
+    std::cout << "Select: ";
+}
 
-	rb->head.store(0);
-	rb->tail.store(0);
-	rb->status.heartbeat.store(0); // 加上這一行, 強制歸零 -> 清除舊的髒數據
-	rb->status.current_temperature.store(40.0f); // 溫度也重置
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: ./driver <tenant_id 0-1>" << std::endl;
+        return 1;
+    }
+    tenant_id = atoi(argv[1]);
 
-	// start Watchdog
-	bool app_running = true;
-	std::thread wd_thread(watchdog_thread_func, rb, &app_running);
+    int fd = open(SHM_FILENAME, O_RDWR, 0666);
+    if (fd == -1) { std::cerr << "Run firmware first!" << std::endl; return 1; }
+    
+    gpu = (GPUState*)mmap(0, sizeof(GPUState), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    gpu->tenants[tenant_id].active = 1;
+    gpu->tenants[tenant_id].pid = getpid();
+    
+    int choice;
+    while (true) {
+        print_menu();
+        if (!(std::cin >> choice)) break;
+        if (choice == 0) break;
 
-	std::cout << "Commands: [1] DRAW (Heat), [2] CLEAR, [3] CHECKSUM, [9] HANG (Test Watchdog), [0] EXIT\n";
-
-	int input;
-	
-	while (std::cin >> input) {
-		bool has_reported_full = false;
-		while (rb->is_full()) {
-			if (!has_reported_full) {
-				std::cout << "Buffer full, need to cool down\n"; 
-					has_reported_full = true;
-			}
-
-			if (input == 0) break; // Exit 指令優先
-			usleep(1000); // 等待 Buffer 空出來
-		}
-
-		uint32_t t = rb->tail.load(std::memory_order_relaxed);
-
-		if (input == 1) {
-			rb->buffer[t].type = CMD_DRAW_RECT;
-			// [Day 2] 必須設定參數
-			rb->buffer[t].params[2] = 100;
-			rb->buffer[t].params[3] = 100;
-		}
-		else if (input == 2) {
-			rb->buffer[t].type = CMD_CLEAR_SCREEN;
-			rb->buffer[t].params[0] = 0xFF0000;
-		}
-
-		else if (input == 3) { // [Day 4] 測試 Assembly
-            rb->buffer[t].type = CMD_CHECKSUM;
-            uint32_t v0 = rand() % 100;
-            uint32_t v1 = rand() % 100;
-            uint32_t v2 = rand() % 100;
-            uint32_t v3 = rand() % 100;
-
-            rb->buffer[t].params[0] = v0;
-            rb->buffer[t].params[1] = v1;
-            rb->buffer[t].params[2] = v2;
-            rb->buffer[t].params[3] = v3;
-
-            // Host 端先算一次答案，用來驗證 Device (Firmware) 算得對不對
-            uint32_t expected = v0 + v1 + v2 + v3;
-
-            std::cout << "[Host] Requesting ASM Checksum for (" 
-                      << v0 << ", " << v1 << ", " << v2 << ", " << v3 
-                      << "). Expect: " << expected << "\n";
+        Command cmd;
+        switch(choice) {
+            case 1: // Draw
+                cmd.type = CMD_DRAW_RECT;
+                cmd.params[0] = rand() % (WIDTH-50); 
+                cmd.params[1] = rand() % (HEIGHT-50);
+                cmd.params[2] = 50; cmd.params[3] = 50;
+                cmd.params[4] = 0xFF00FF00;
+                send_command(cmd);
+                break;
+            case 2: // Clear
+                cmd.type = CMD_CLEAR;
+                cmd.params[0] = 0xFF222222;
+                send_command(cmd);
+                break;
+            case 3: // ASM Checksum
+                cmd.type = CMD_CHECKSUM;
+                cmd.params[0] = 100;
+                cmd.params[1] = 250;
+                send_command(cmd);
+                std::cout << "Sent Checksum Command (100 + 250). Check Firmware Output." << std::endl;
+                break;
+            case 4: // DMA
+                {
+                    uint32_t* dma = gpu->tenants[tenant_id].dma_staging_area;
+                    for(int i=0; i<64*64; i++) dma[i] = 0xFFFF00FF;
+                    cmd.type = CMD_DMA_TEXTURE;
+                    cmd.params[0] = 100; cmd.params[1] = 100; 
+                    cmd.params[2] = 64; cmd.params[3] = 64;
+                    send_command(cmd);
+                }
+                break;
+            case 9: // HANG
+                cmd.type = CMD_HANG;
+                send_command(cmd);
+                std::cout << "!!! Sent HANG Command. Watch firmware console for Reset !!!" << std::endl;
+                break;
         }
+    }
 
-		else if (input == 9) { // [Day 3] 測試看門狗
-		rb->buffer[t].type = CMD_SIMULATE_HANG;
-		std::cout << "[Host] Sending HANG command...\n";
-		} else if (input == 0) {
-		rb->buffer[t].type = CMD_EXIT;
-		rb->tail.store((t + 1) % RING_SIZE, std::memory_order_release);
-		app_running = false; // 停止 Watchdog
-		std::cout << "Exit command sent to Firmware.\n";
-		break;
-		} else {
-		continue;
-		}
-
-		rb->tail.store((t + 1) % RING_SIZE, std::memory_order_release);
-
-		// Telemetry 顯示
-		if (input != 3)
-		printf("[Host] GPU Temp: %.2f°C\n",
-				rb->status.current_temperature.load());
-	}
-
-	if (wd_thread.joinable())
-		wd_thread.join();
-	munmap(rb, sizeof(CommandRingBuffer));
-	return 0;
+    gpu->tenants[tenant_id].active = 0;
+    return 0;
 }

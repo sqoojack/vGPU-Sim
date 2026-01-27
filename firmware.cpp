@@ -1,139 +1,199 @@
-// clang++ -std=c++17 firmware.cpp -o firmware
-#include "common.h"
-#include <fcntl.h>
+// g++ firmware.cpp -o firmware -lpthread
+// ./firmware
 #include <iostream>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <cstring>
+#include <cstdio>
+#include <pthread.h>
+#include <time.h>
+#include "common.h"
 
-const float AMBIENT_TEMP = 40.0f;
-const float COOLING_FACTOR = 0.05f;
-const float THERMAL_LIMIT = 80.0f; // [Day 3] 溫度最高限制
+struct GPUState* gpu;
 
-// [Day 4] ARM64 Inline Assembly 優化範例
-// 功能：使用組合語言快速計算陣列的總和 (Checksum)
-// 證明點：你懂暫存器 (Registers) 和記憶體存取
-uint32_t checksum_arm64(const uint32_t *data, size_t count) {
-	uint32_t result = 0;
-	if (count == 0) return 0;
-	// x0 (input %1) = data pointer
-	// x1 (input %2) = count
-	// w0 (output %0) = result
-	// w3 = temp register
-	asm volatile(
-			"mov %w[res], #0\n\t"          // 初始化結果，使用編譯器分配的暫存器，而非硬編碼 w0
-			"1:\n\t"
-			"ldr w3, [%[ptr]], #4\n\t"     // 從指標讀取資料，並自動將指標 +4
-			"add %w[res], %w[res], w3\n\t" // 累加
-			"subs %[cnt], %[cnt], #1\n\t"  // 剩餘數量 -1
-			"b.ne 1b\n\t"                  // 若還有剩下的則繼續
-			: [res] "=&r"(result),         // 輸出
-			[ptr] "+r"(data),            // 輸入與輸出（指標會變動）
-			[cnt] "+r"(count)            // 輸入與輸出（計數會變動）
-			: 
-			: "w3", "cc", "memory"
-	);
-
-	return result;
+// --- 1. ARM64 Assembly Optimization ---
+// 使用 ARM64 組合語言實作高效加法
+// %w0 = 32-bit register (w0, w1...)
+uint32_t asm_add(uint32_t a, uint32_t b) {
+    uint32_t res;
+    // volatile 告訴編譯器不要優化這段 Code，必須執行
+    __asm__ volatile (
+        "add %w0, %w1, %w2"  // 組合語言指令: add res, a, b
+        : "=r" (res)         // 輸出: res
+        : "r" (a), "r" (b)   // 輸入: a, b
+    );
+    return res;
 }
 
-// 輔助函式：原子浮點數加法
-void add_temp_atomic(std::atomic<float> &atomic_temp, float delta) {
-	float current = atomic_temp.load(std::memory_order_relaxed);
-	float desired;
-	do {
-		desired = current + delta;
-	} while (!atomic_temp.compare_exchange_weak(
-		current, desired, std::memory_order_release, std::memory_order_acquire));
+// --- 2. Watchdog Mechanism ---
+// 模擬硬體看門狗計時器 (Hardware Watchdog Timer)
+void* watchdog_thread(void* arg) {
+    std::cout << "[Watchdog] Monitoring thread started..." << std::endl;
+    
+    while (gpu->running) {
+        uint64_t current_time = (uint64_t)time(NULL);
+        
+        // 檢查 Heartbeat 是否超時 (例如超過 3 秒沒更新)
+        if (current_time - gpu->last_heartbeat > 3) {
+            std::cerr << "\n[!!! CRITICAL !!!] WATCHDOG TIMEOUT DETECTED!" << std::endl;
+            std::cerr << "[Watchdog] Firmware hung. Performing Hard Reset..." << std::endl;
+            
+            // 執行重置邏輯
+            gpu->watchdog_reset_count++;
+            gpu->temperature = 40.0f; // 重置溫度
+            
+            // 在真實硬體會重啟，這裡我們強制跳出死迴圈或重啟主迴圈
+            // 為了演示，我們簡單地更新 heartbeat 讓系統「復活」
+            // 並印出重置訊息
+            gpu->last_heartbeat = current_time; 
+            
+            // 注意：如果主執行緒卡在 while(true)，這裡通常需要 kill process
+            // 但為了讓 Streamlit 繼續顯示，我們這裡只做標記
+            // 真實情況：exit(1); 讓 systemd 重啟服務
+        }
+        sleep(1);
+    }
+    return NULL;
+}
+
+// 初始化同步物件
+void init_sync_obj(pthread_mutex_t* m, pthread_cond_t* c_full, pthread_cond_t* c_empty) {
+    pthread_mutexattr_t mattr;
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(m, &mattr);
+    pthread_mutexattr_destroy(&mattr);
+
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
+    pthread_cond_init(c_full, &cattr);
+    pthread_cond_init(c_empty, &cattr);
+    pthread_condattr_destroy(&cattr);
+}
+
+void put_pixel(int x, int y, uint32_t color) {
+    if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+        gpu->vram[y * WIDTH + x] = color;
+    }
+}
+
+void process_command(int tenant_id, Command& cmd) {
+    switch (cmd.type) {
+        case CMD_CLEAR: {
+            uint32_t color = cmd.params[0];
+            for (int i = 0; i < WIDTH * HEIGHT; ++i) gpu->vram[i] = color;
+            break;
+        }
+        case CMD_DRAW_RECT: {
+            int x = cmd.params[0], y = cmd.params[1];
+            int w = cmd.params[2], h = cmd.params[3];
+            uint32_t color = cmd.params[4];
+            for (int dy = 0; dy < h; ++dy) {
+                for (int dx = 0; dx < w; ++dx) {
+                    put_pixel(x + dx, y + dy, color);
+                }
+            }
+            break;
+        }
+        case CMD_DMA_TEXTURE: {
+            int x = cmd.params[0], y = cmd.params[1];
+            int w = cmd.params[2], h = cmd.params[3];
+            uint32_t* src = gpu->tenants[tenant_id].dma_staging_area;
+            for (int dy = 0; dy < h; ++dy) {
+                for (int dx = 0; dx < w; ++dx) {
+                    put_pixel(x + dx, y + dy, src[dy * w + dx]);
+                }
+            }
+            break;
+        }
+        case CMD_CHECKSUM: {
+            // 使用 ARM64 Assembly 進行運算
+            uint32_t val1 = cmd.params[0];
+            uint32_t val2 = cmd.params[1];
+            uint32_t result = asm_add(val1, val2);
+            std::cout << "[ASM Accelerator] " << val1 << " + " << val2 << " = " << result << std::endl;
+            // 視覺化回饋：加法執行時，畫面閃一下白色
+            gpu->vram[0] = 0xFFFFFFFF; 
+            break;
+        }
+        case CMD_HANG: {
+            std::cout << "[Firmware] Received HANG command. Simulating infinite loop..." << std::endl;
+            // 故意進入死迴圈，不更新 Heartbeat
+            // 這會導致 Watchdog Thread 在 3 秒後報警
+            while(true) {
+                // Do nothing, just freeze
+                // 為了讓 OS 不殺掉我們，sleep 極短時間但不出讓邏輯控制
+                usleep(100); 
+            }
+            break;
+        }
+    }
 }
 
 int main() {
-	int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
-	if (shm_fd == -1) {
-		std::cerr << "Error: shm_open failed. Run driver first.\n";
-		return 1;
-	}
+    int fd = open(SHM_FILENAME, O_CREAT | O_RDWR, 0666);
+    if (fd == -1) { perror("open"); return 1; }
+    if (ftruncate(fd, sizeof(GPUState)) == -1) { perror("ftruncate"); return 1; }
 
-	auto *rb =
-		(CommandRingBuffer *)mmap(NULL, sizeof(CommandRingBuffer),
-									PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    gpu = (GPUState*)mmap(0, sizeof(GPUState), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    memset(gpu, 0, sizeof(GPUState));
+    gpu->magic = 0x56475055;
+    gpu->running = 1;
+    gpu->last_heartbeat = (uint64_t)time(NULL);
+    
+    for(int i=0; i<MAX_TENANTS; i++) {
+        init_sync_obj(&gpu->tenants[i].lock, &gpu->tenants[i].not_full, &gpu->tenants[i].not_empty);
+    }
 
-	rb->status.current_temperature.store(40.0f);
-	rb->status.heartbeat.store(0); // [Day 3] 初始化心跳
+    // 啟動 Watchdog 執行緒
+    pthread_t wd_thread;
+    pthread_create(&wd_thread, NULL, watchdog_thread, NULL);
 
-	std::cout << "[Firmware] System Online. Thermal Limit: " << THERMAL_LIMIT
-				<< "°C\n";
+    std::cout << "[vGPU Firmware] Booted (Features: ARM64 ASM, Watchdog, Throttling)" << std::endl;
 
-	while (true) {
-		// --- [Day 3] Watchdog Heartbeat 更新 ---
-		rb->status.heartbeat.fetch_add(1, std::memory_order_relaxed);
+    while (gpu->running) {
+        // 1. 餵狗 (Feed the Dog)
+        // 只要這行有執行，Watchdog 就不會叫
+        gpu->last_heartbeat = (uint64_t)time(NULL);
 
-		// --- 物理散熱計算 ---
-		float current_t =
-			rb->status.current_temperature.load(std::memory_order_relaxed);
-		float cooling = COOLING_FACTOR * (current_t - AMBIENT_TEMP);
-		add_temp_atomic(rb->status.current_temperature, -cooling);
+        // 2. 溫度過高機制 (Thermal Throttling)
+        if (gpu->temperature > 85.0f) {
+            std::cout << "[Thermal] Overheating! Throttling performance..." << std::endl;
+            usleep(50000); // 強制降頻 (Sleep 50ms)
+            gpu->temperature -= 0.5f; // 模擬降溫
+        }
 
-		// --- [Day 3] Thermal Throttling (過熱降頻) ---
-		if (current_t > THERMAL_LIMIT) {
-			std::cout << "[WARN] Thermal Throttling Active! Slowing down...\n";
-			usleep(500000); // 降速：強制睡 0.5 秒
-			continue;	// 跳過後面的指令讀取與處理，直接進入下一次自然散熱循環
-		}
+        bool idle = true;
+        for (int i = 0; i < MAX_TENANTS; ++i) {
+            TenantContext& ctx = gpu->tenants[i];
+            if (!ctx.active) continue;
 
-		if (rb->is_empty()) {
-			usleep(10000); // 閒置時稍微休息，避免 CPU 100%
-			continue;
-		}
+            pthread_mutex_lock(&ctx.lock);
+            if (ctx.head != ctx.tail) {
+                idle = false;
+                Command cmd = ctx.cmd_buffer[ctx.head];
+                ctx.head = (ctx.head + 1) % RING_BUFFER_SIZE;
+                pthread_cond_signal(&ctx.not_full);
+                pthread_mutex_unlock(&ctx.lock);
 
-		uint32_t h = rb->head.load(std::memory_order_acquire);
-		Command cmd = rb->buffer[h];
-		float heat_gain = 0.0f;
+                process_command(i, cmd);
+                gpu->temperature += 0.5f; // 操作導致升溫
+            } else {
+                pthread_mutex_unlock(&ctx.lock);
+            }
+        }
 
-		// 指令解析
-		if (cmd.type == CMD_DRAW_RECT) {
-		// [Day 2] 使用 params 計算熱量
-		float area_factor = (cmd.params[2] * cmd.params[3]) / 10000.0f;
-		heat_gain = 1.5f + area_factor;
-		usleep(150000);
-		} else if (cmd.type == CMD_CLEAR_SCREEN) {
-		heat_gain = 0.5f;
-		usleep(50000);
-		}
+        if (idle) {
+            if (gpu->temperature > 30.0f) gpu->temperature -= 0.1f; // 自然冷卻
+            usleep(2000);
+        } else {
+            usleep(100);
+        }
+        gpu->frame_counter++;
+    }
 
-		else if (cmd.type == CMD_CHECKSUM) {
-			// 呼叫 Assembly 優化函式
-			// 計算 params[4] 陣列的總和
-			uint32_t sum = checksum_arm64(cmd.params, 4);
-			std::cout << "[GPU] ASM Checksum: " << sum << " (Verified)\n";
-			heat_gain = 0.2f; // 運算也產熱
-			usleep(10000);
-		}
-
-		else if (cmd.type == CMD_SIMULATE_HANG) {
-		// 模擬當機: 進入死迴圈，不再更新 Heartbeat
-		std::cout << "[FATAL] Simulating Infinite Loop Hang...\n";
-		while (true) {
-			usleep(100000);
-		}
-		} else if (cmd.type == CMD_EXIT) {
-		// 修正：退出前先更新 head，確保 Driver 知道指令已處理
-		rb->head.store((h + 1) % RING_SIZE, std::memory_order_release);
-		std::cout << "[GPU] Shutdown command received.\n";
-		break;
-		}
-
-		// 應用熱量
-		add_temp_atomic(rb->status.current_temperature, heat_gain);
-
-		printf("[GPU] CMD: %d | Temp: %.2f°C %s\n", 
-           cmd.type, 
-           rb->status.current_temperature.load(),
-           (rb->status.current_temperature.load() > THERMAL_LIMIT ? "[THROTTLED]" : ""));
-
-		// 完成指令，更新 head
-		rb->head.store((h + 1) % RING_SIZE, std::memory_order_release);
-	}
-
-	shm_unlink(SHM_NAME); // 清理共享記憶體
-	return 0;
+    return 0;
 }
